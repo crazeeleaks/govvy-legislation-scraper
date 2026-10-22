@@ -132,6 +132,9 @@ class Scraper:
                 print("  retrying %s (%s)" % (url, e), file=sys.stderr)
                 time.sleep(2 * (i + 1))
 
+    def save_cache(self):
+        self.cache_file.write_text(json.dumps(self.cache))
+
     def read_text(self, doc_id):
         return (self.text_dir / (doc_id + ".txt")).read_text(encoding="utf-8")
 
@@ -150,7 +153,9 @@ class Scraper:
             sha = hashlib.sha256(r.content).hexdigest()
             (self.files_dir / (sha + ".pdf")).write_bytes(r.content)
             self.cache[cache_key] = sha
-            self.cache_file.write_text(json.dumps(self.cache, indent=1))
+            # writing the whole cache after every file gets slow, so batch it
+            if len(self.cache) % 25 == 0:
+                self.save_cache()
 
         txt = self.text_dir / (sha + ".txt")
         if not txt.exists():
@@ -513,6 +518,7 @@ class Scraper:
         return "\n".join(out)
 
     def save(self, year):
+        self.save_cache()
         with open(self.out / "documents.jsonl", "w", encoding="utf-8") as f:
             for doc in self.documents.values():
                 f.write(json.dumps(doc, default=to_json) + "\n")
