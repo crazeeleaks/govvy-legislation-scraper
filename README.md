@@ -28,6 +28,16 @@ Other options:
 --skip-city         skip the city website
 --skip-civicclerk   skip CivicClerk
 --refresh           re-download everything
+--scan-ids A B      check DocumentCenter ids A through B for unlinked pdfs
+--summarize         extract structured json for each bill with gemini
+--model NAME        gemini model (default: gemini-2.5-flash)
+```
+
+`--summarize` needs a Gemini API key:
+
+```bash
+export GEMINI_API_KEY=your-key
+python civic_scraper.py --year 2026 --summarize
 ```
 
 First run for a full year downloads around 850 PDFs, so it takes a while. Files are cached after that.
@@ -40,6 +50,8 @@ data/
 ├── documents.jsonl
 ├── events.jsonl
 ├── manifest.json
+├── unlinked_matches.csv
+├── summaries/
 ├── context/
 ├── files/
 └── text/
@@ -49,6 +61,8 @@ data/
 - `documents.jsonl` - every PDF with tags (`leg:147-2026`, `event:583`, `kind:minutes`, etc.)
 - `events.jsonl` - meetings and agenda items
 - `context/` - one markdown file per ordinance/resolution with everything above plus the full text
+- `unlinked_matches.csv` - pdfs found with `--scan-ids` and the legislation they were matched to (regex on the number, or rapidfuzz on the title)
+- `summaries/` - gemini output per bill. Entities, dates and dollar amounts that don't appear in the bill text get dropped
 - `files/`, `text/` - PDFs and extracted text, named by sha256
 
 ## Notes
@@ -57,4 +71,5 @@ data/
 - PDFs linked through docaccess.com are the same files as the originals. The `v` parameter in their URLs is the sha256 of the file.
 - CivicClerk has a public API at `https://clevelandheightsoh.api.civicclerk.com/v1`, so no browser automation is needed.
 - The city's listing page URLs change every year. Add new ones to `LISTING_PAGES` in `civic_scraper.py`.
+- Unlinked pdfs are only kept if the server says they're `application/pdf`.
 - Vote `passFail` from CivicClerk isn't reliable, use the vote tallies instead.

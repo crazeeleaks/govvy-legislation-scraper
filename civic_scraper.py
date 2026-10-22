@@ -8,6 +8,7 @@ them by legislation number.
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 import time
@@ -15,9 +16,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
+from rapidfuzz import fuzz, process
 
 CITY_URL = "https://www.clevelandheights.gov"
 API_URL = "https://clevelandheightsoh.api.civicclerk.com/v1"
@@ -32,6 +35,28 @@ LISTING_PAGES = {
 }
 
 DELAY = 0.4
+
+SUMMARY_PROMPT = """You summarize local legislation for a civic engagement app.
+
+Rules:
+- Use only the bill text provided. Do not add outside context, intent, fiscal impact or outcomes.
+- If something isn't in the text, write "Not specified in the bill text."
+- Copy names of agencies, organizations and dates exactly as they are written in the text.
+- Write for a general reader, neutral tone, plain language.
+
+Return JSON with these fields:
+{
+  "one_sentence_summary": "...",
+  "plain_language_summary": "...",
+  "what_the_bill_does": ["..."],
+  "who_is_affected": ["..."],
+  "government_actions_required": ["..."],
+  "dollar_amounts": ["..."],
+  "key_dates_or_deadlines": ["..."],
+  "agencies_or_entities_mentioned": ["..."],
+  "uncertainties": ["..."]
+}
+"""
 
 # matches things like "ORDINANCE NO. 147-2026(F)", "RES 144-2026(AS)", "Ord. 241-2025"
 LEG_RE = re.compile(
@@ -124,6 +149,8 @@ class Scraper:
             try:
                 time.sleep(DELAY)
                 r = self.session.get(url, params=params, timeout=60)
+                if r.status_code == 404:
+                    return r
                 r.raise_for_status()
                 return r
             except requests.RequestException as e:
@@ -138,7 +165,7 @@ class Scraper:
     def read_text(self, doc_id):
         return (self.text_dir / (doc_id + ".txt")).read_text(encoding="utf-8")
 
-    def download(self, cache_key, file_url, **info):
+    def download(self, cache_key, file_url, check_type=False, **info):
         """Download a pdf (if we don't have it yet) and add it to self.documents."""
         sha = self.cache.get(cache_key)
         if not sha or not (self.files_dir / (sha + ".pdf")).exists():
@@ -146,6 +173,8 @@ class Scraper:
                 r = self.get(file_url)
             except requests.RequestException as e:
                 print("  failed %s: %s" % (cache_key, e), file=sys.stderr)
+                return None
+            if check_type and "pdf" not in r.headers.get("Content-Type", "").lower():
                 return None
             if not r.content.startswith(b"%PDF"):
                 print("  not a pdf: %s" % cache_key, file=sys.stderr)
@@ -442,6 +471,117 @@ class Scraper:
                         self.get_leg(k)["cites"].add(key)
                         leg["cited_by"].add(k)
 
+    def scan_ids(self, start, end):
+        # DocumentCenter ids are sequential, so step through a range to find pdfs that aren't linked anywhere
+        known = set()
+        for leg in self.legislation.values():
+            if leg["city_listing"]:
+                known.add(leg["city_listing"]["documentcenter_id"])
+
+        found = []
+        for i in range(start, end + 1):
+            if i in known or self.cache.get("scan:%d" % i) == "":
+                continue
+            url = "%s/DocumentCenter/View/%d" % (CITY_URL, i)
+            doc = self.download(
+                "city:" + url,
+                url,
+                check_type=True,
+                kind="unlinked",
+                source="city_website",
+                title="DocumentCenter %d" % i,
+                url=url,
+                documentcenter_id=i,
+            )
+            if doc:
+                found.append((i, doc))
+            else:
+                self.cache["scan:%d" % i] = ""
+        print("scan: %d unlinked pdfs in %d-%d" % (len(found), start, end))
+        self.match_unlinked(found)
+
+    def match_unlinked(self, found):
+        # try the legislation number first, then fall back to fuzzy matching the title
+        index = pd.DataFrame(
+            [{"key": k, "title": l["title"]} for k, l in self.legislation.items() if l["title"]],
+            columns=["key", "title"],
+        )
+        rows = []
+        for doc_center_id, doc in found:
+            head = clean(self.read_text(doc["doc_id"])[:2000])
+            row = {
+                "documentcenter_id": doc_center_id,
+                "doc_id": doc["doc_id"],
+                "key": None,
+                "method": None,
+                "score": None,
+            }
+            refs = find_refs(head)
+            if refs:
+                row.update(key=next(iter(refs)), method="regex", score=100)
+            elif len(index):
+                m = process.extractOne(
+                    head, index["title"].tolist(), scorer=fuzz.token_set_ratio, score_cutoff=85
+                )
+                if m:
+                    row.update(key=index["key"].iloc[m[2]], method="fuzzy", score=round(m[1], 1))
+            rows.append(row)
+
+        df = pd.DataFrame(rows, columns=["documentcenter_id", "doc_id", "key", "method", "score"])
+        df = df.drop_duplicates(subset="doc_id")
+        df.to_csv(self.out / "unlinked_matches.csv", index=False)
+        for r in df[df["key"].notna()].itertuples():
+            self.get_leg(r.key)["documents"].add(r.doc_id)
+            self.documents[r.doc_id]["tags"].add("leg:" + r.key)
+        print("  matched %d of %d" % (df["key"].notna().sum(), len(df)))
+
+    def summarize(self, model):
+        if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+            print("set GEMINI_API_KEY to use --summarize", file=sys.stderr)
+            return
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client()
+        config = types.GenerateContentConfig(
+            system_instruction=SUMMARY_PROMPT,
+            response_mime_type="application/json",
+            temperature=0,
+        )
+        out_dir = self.out / "summaries"
+        out_dir.mkdir(exist_ok=True)
+
+        for key, leg in self.legislation.items():
+            path = out_dir / (key + ".json")
+            doc = self.find_text_doc(leg)
+            if path.exists() or not doc:
+                continue
+            text = self.read_text(doc["doc_id"])
+            if len(text.strip()) < 100:
+                continue
+
+            print("summarizing", key)
+            try:
+                resp = client.models.generate_content(
+                    model=model, contents="Bill text:\n\n" + text[:60000], config=config
+                )
+                data = json.loads(resp.text)
+            except Exception as e:
+                print("  failed %s: %s" % (key, e), file=sys.stderr)
+                continue
+
+            # drop anything in these lists that doesn't actually appear in the bill
+            source = clean(text).lower()
+            for field in ("agencies_or_entities_mentioned", "key_dates_or_deadlines", "dollar_amounts"):
+                items = data.get(field) or []
+                data[field] = [x for x in items if isinstance(x, str) and clean(x).lower() in source]
+
+            data["key"] = key
+            data["source_doc_id"] = doc["doc_id"]
+            data["model"] = model
+            path.write_text(json.dumps(data, indent=1))
+            time.sleep(DELAY)
+
     def find_text_doc(self, leg):
         # prefer the version on the city site, otherwise the agenda attachment
         docs = [self.documents[d] for d in leg["documents"] if d in self.documents]
@@ -570,15 +710,28 @@ def main():
     parser.add_argument("--skip-city", action="store_true")
     parser.add_argument("--skip-civicclerk", action="store_true")
     parser.add_argument("--refresh", action="store_true", help="ignore download cache")
+    parser.add_argument(
+        "--scan-ids",
+        nargs=2,
+        type=int,
+        metavar=("START", "END"),
+        help="look for unlinked DocumentCenter pdfs",
+    )
+    parser.add_argument("--summarize", action="store_true", help="extract structured json with gemini")
+    parser.add_argument("--model", default="gemini-2.5-flash", help="gemini model for --summarize")
     args = parser.parse_args()
 
     scraper = Scraper(args.out, refresh=args.refresh)
     if not args.skip_city:
         scraper.scrape_city(args.year)
+    if args.scan_ids:
+        scraper.scan_ids(*args.scan_ids)
     if not args.skip_civicclerk:
         scraper.scrape_civicclerk(args.year, args.max_events, args.attachments, args.packets)
     scraper.link()
     counts = scraper.save(args.year)
+    if args.summarize:
+        scraper.summarize(args.model)
     print(json.dumps(counts, indent=1))
 
 
